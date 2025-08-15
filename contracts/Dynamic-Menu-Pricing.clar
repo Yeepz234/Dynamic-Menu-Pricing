@@ -12,6 +12,9 @@
 (define-constant ERR-INSUFFICIENT-FUNDS (err u105))
 (define-constant ERR-INVALID-ITEM (err u106))
 (define-constant ERR-INVALID-MULTIPLIER (err u107))
+(define-constant ERR-RESERVATION-EXISTS (err u108))
+(define-constant ERR-NO-RESERVATION (err u109))
+(define-constant ERR-RESERVATION-EXPIRED (err u110))
 
 (define-constant PEAK-HOUR-START u11)
 (define-constant PEAK-HOUR-END u14)
@@ -19,6 +22,7 @@
 (define-constant EVENING-PEAK-END u21)
 (define-constant BLOCKS-PER-HOUR u144)
 (define-constant VOTING-PERIOD u1000)
+(define-constant RESERVATION-DURATION u144)
 
 ;; data vars
 (define-data-var contract-owner principal tx-sender)
@@ -58,6 +62,16 @@
 (define-map hourly-multipliers
   { hour: uint }
   { multiplier: uint }
+)
+
+(define-map item-reservations
+  { customer: principal, item-id: uint }
+  { 
+    quantity: uint,
+    reserved-price: uint,
+    expiry-block: uint,
+    created-block: uint
+  }
 )
 
 ;; public functions
@@ -183,6 +197,68 @@
     (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-OWNER-ONLY)
     (var-set contract-owner new-owner)
     (ok true)
+  )
+)
+
+(define-public (reserve-item (item-id uint) (quantity uint))
+  (let (
+    (item (unwrap! (map-get? menu-items { item-id: item-id }) ERR-NOT-FOUND))
+    (current-block stacks-block-height)
+    (current-price (get-dynamic-price item-id))
+    (expiry-block (+ current-block RESERVATION-DURATION))
+    (existing-reservation (map-get? item-reservations { customer: tx-sender, item-id: item-id }))
+  )
+    (asserts! (get active item) ERR-INVALID-ITEM)
+    (asserts! (> quantity u0) ERR-INVALID-ITEM)
+    (asserts! (is-none existing-reservation) ERR-RESERVATION-EXISTS)
+    
+    (map-set item-reservations 
+      { customer: tx-sender, item-id: item-id }
+      {
+        quantity: quantity,
+        reserved-price: current-price,
+        expiry-block: expiry-block,
+        created-block: current-block
+      }
+    )
+    (ok { price: current-price, expiry: expiry-block })
+  )
+)
+
+(define-public (cancel-reservation (item-id uint))
+  (let (
+    (reservation (unwrap! (map-get? item-reservations { customer: tx-sender, item-id: item-id }) ERR-NO-RESERVATION))
+  )
+    (map-delete item-reservations { customer: tx-sender, item-id: item-id })
+    (ok true)
+  )
+)
+
+(define-public (order-reserved-item (item-id uint))
+  (let (
+    (item (unwrap! (map-get? menu-items { item-id: item-id }) ERR-NOT-FOUND))
+    (reservation (unwrap! (map-get? item-reservations { customer: tx-sender, item-id: item-id }) ERR-NO-RESERVATION))
+    (current-block stacks-block-height)
+    (current-day (get-current-day))
+    (current-demand (default-to { orders: u0, total-revenue: u0 } 
+                    (map-get? daily-demand { item-id: item-id, day: current-day })))
+    (reserved-quantity (get quantity reservation))
+    (reserved-price (get reserved-price reservation))
+    (total-cost (* reserved-price reserved-quantity))
+  )
+    (asserts! (get active item) ERR-INVALID-ITEM)
+    (asserts! (< current-block (get expiry-block reservation)) ERR-RESERVATION-EXPIRED)
+    
+    (map-delete item-reservations { customer: tx-sender, item-id: item-id })
+    
+    (map-set daily-demand 
+      { item-id: item-id, day: current-day }
+      {
+        orders: (+ (get orders current-demand) reserved-quantity),
+        total-revenue: (+ (get total-revenue current-demand) total-cost)
+      }
+    )
+    (ok total-cost)
   )
 )
 
@@ -315,6 +391,43 @@
       demand-multiplier: (get-demand-multiplier item-id),
       vote-multiplier: (get-vote-multiplier item-id)
     })
+  )
+)
+
+(define-read-only (get-reservation (customer principal) (item-id uint))
+  (map-get? item-reservations { customer: customer, item-id: item-id })
+)
+
+(define-read-only (is-reservation-valid (customer principal) (item-id uint))
+  (let (
+    (reservation (map-get? item-reservations { customer: customer, item-id: item-id }))
+    (current-block stacks-block-height)
+  )
+    (if (is-some reservation)
+      (< current-block (get expiry-block (unwrap-panic reservation)))
+      false
+    )
+  )
+)
+
+(define-read-only (get-reservation-savings (customer principal) (item-id uint))
+  (let (
+    (reservation (map-get? item-reservations { customer: customer, item-id: item-id }))
+    (current-price (get-dynamic-price item-id))
+  )
+    (if (is-some reservation)
+      (let (
+        (reserved-price (get reserved-price (unwrap-panic reservation)))
+        (quantity (get quantity (unwrap-panic reservation)))
+      )
+        (some {
+          reserved-total: (* reserved-price quantity),
+          current-total: (* current-price quantity),
+          savings: (* (- current-price reserved-price) quantity)
+        })
+      )
+      none
+    )
   )
 )
 
