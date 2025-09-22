@@ -15,6 +15,9 @@
 (define-constant ERR-RESERVATION-EXISTS (err u108))
 (define-constant ERR-NO-RESERVATION (err u109))
 (define-constant ERR-RESERVATION-EXPIRED (err u110))
+(define-constant ERR-BUNDLE-NOT-FOUND (err u111))
+(define-constant ERR-INVALID-BUNDLE (err u112))
+(define-constant ERR-BUNDLE-INACTIVE (err u113))
 
 (define-constant PEAK-HOUR-START u11)
 (define-constant PEAK-HOUR-END u14)
@@ -29,6 +32,7 @@
 (define-data-var base-surge-multiplier uint u150)
 (define-data-var vote-threshold uint u10)
 (define-data-var menu-item-counter uint u0)
+(define-data-var bundle-counter uint u0)
 
 ;; data maps
 (define-map menu-items 
@@ -72,6 +76,29 @@
     expiry-block: uint,
     created-block: uint
   }
+)
+
+(define-map menu-bundles
+  { bundle-id: uint }
+  {
+    name: (string-ascii 50),
+    description: (string-ascii 100),
+    discount-percentage: uint,
+    active: bool,
+    orders-count: uint,
+    total-revenue: uint,
+    created-block: uint
+  }
+)
+
+(define-map bundle-items
+  { bundle-id: uint, item-id: uint }
+  { quantity: uint }
+)
+
+(define-map bundle-daily-stats
+  { bundle-id: uint, day: uint }
+  { orders: uint, revenue: uint }
 )
 
 ;; public functions
@@ -197,6 +224,101 @@
     (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-OWNER-ONLY)
     (var-set contract-owner new-owner)
     (ok true)
+  )
+)
+
+(define-public (create-bundle (name (string-ascii 50)) (description (string-ascii 100)) (discount-percentage uint))
+  (let ((bundle-id (+ (var-get bundle-counter) u1)))
+    (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-OWNER-ONLY)
+    (asserts! (<= discount-percentage u50) ERR-INVALID-BUNDLE)
+    
+    (map-set menu-bundles
+      { bundle-id: bundle-id }
+      {
+        name: name,
+        description: description,
+        discount-percentage: discount-percentage,
+        active: false,
+        orders-count: u0,
+        total-revenue: u0,
+        created-block: stacks-block-height
+      }
+    )
+    (var-set bundle-counter bundle-id)
+    (ok bundle-id)
+  )
+)
+
+(define-public (bundle-item (bundle-id uint) (item-id uint) (quantity uint))
+  (let (
+    (bundle (unwrap! (map-get? menu-bundles { bundle-id: bundle-id }) ERR-BUNDLE-NOT-FOUND))
+    (item (unwrap! (map-get? menu-items { item-id: item-id }) ERR-NOT-FOUND))
+  )
+    (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-OWNER-ONLY)
+    (asserts! (get active item) ERR-INVALID-ITEM)
+    (asserts! (> quantity u0) ERR-INVALID-BUNDLE)
+    
+    (map-set bundle-items
+      { bundle-id: bundle-id, item-id: item-id }
+      { quantity: quantity }
+    )
+    (ok true)
+  )
+)
+
+(define-public (activate-bundle (bundle-id uint))
+  (let ((bundle (unwrap! (map-get? menu-bundles { bundle-id: bundle-id }) ERR-BUNDLE-NOT-FOUND)))
+    (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-OWNER-ONLY)
+    
+    (map-set menu-bundles
+      { bundle-id: bundle-id }
+      (merge bundle { active: true })
+    )
+    (ok true)
+  )
+)
+
+(define-public (deactivate-bundle (bundle-id uint))
+  (let ((bundle (unwrap! (map-get? menu-bundles { bundle-id: bundle-id }) ERR-BUNDLE-NOT-FOUND)))
+    (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-OWNER-ONLY)
+    
+    (map-set menu-bundles
+      { bundle-id: bundle-id }
+      (merge bundle { active: false })
+    )
+    (ok true)
+  )
+)
+
+(define-public (order-bundle (bundle-id uint))
+  (let (
+    (bundle (unwrap! (map-get? menu-bundles { bundle-id: bundle-id }) ERR-BUNDLE-NOT-FOUND))
+    (bundle-price (get-bundle-price bundle-id))
+    (current-day (get-current-day))
+    (current-stats (default-to { orders: u0, revenue: u0 }
+                               (map-get? bundle-daily-stats { bundle-id: bundle-id, day: current-day })))
+  )
+    (asserts! (get active bundle) ERR-BUNDLE-INACTIVE)
+    (asserts! (> bundle-price u0) ERR-INVALID-BUNDLE)
+    
+    (map-set menu-bundles
+      { bundle-id: bundle-id }
+      (merge bundle {
+        orders-count: (+ (get orders-count bundle) u1),
+        total-revenue: (+ (get total-revenue bundle) bundle-price)
+      })
+    )
+    
+    (map-set bundle-daily-stats
+      { bundle-id: bundle-id, day: current-day }
+      {
+        orders: (+ (get orders current-stats) u1),
+        revenue: (+ (get revenue current-stats) bundle-price)
+      }
+    )
+    
+    (unwrap-panic (record-bundle-item-demand bundle-id))
+    (ok bundle-price)
   )
 )
 
@@ -431,7 +553,134 @@
   )
 )
 
+(define-read-only (get-bundle (bundle-id uint))
+  (map-get? menu-bundles { bundle-id: bundle-id })
+)
+
+(define-read-only (get-bundle-items (bundle-id uint))
+  (fold get-single-bundle-item (list u1 u2 u3 u4 u5) { bundle-id: bundle-id, items: (list) })
+)
+
+(define-read-only (get-bundle-price (bundle-id uint))
+  (let (
+    (bundle (unwrap! (map-get? menu-bundles { bundle-id: bundle-id }) u0))
+    (total-price (fold calculate-bundle-item-price (list u1 u2 u3 u4 u5) { bundle-id: bundle-id, total: u0 }))
+    (discount (get discount-percentage bundle))
+  )
+    (- (get total total-price) (/ (* (get total total-price) discount) u100))
+  )
+)
+
+(define-read-only (get-bundle-savings (bundle-id uint))
+  (match (map-get? menu-bundles { bundle-id: bundle-id })
+    bundle
+    (let (
+      (individual-price (fold calculate-bundle-item-price (list u1 u2 u3 u4 u5) { bundle-id: bundle-id, total: u0 }))
+      (bundle-price (get-bundle-price bundle-id))
+      (discount (get discount-percentage bundle))
+    )
+      {
+        individual-total: (get total individual-price),
+        bundle-price: bundle-price,
+        savings: (- (get total individual-price) bundle-price),
+        discount-percentage: discount
+      }
+    )
+    {
+      individual-total: u0,
+      bundle-price: u0,
+      savings: u0,
+      discount-percentage: u0
+    }
+  )
+)
+
+(define-read-only (get-bundle-analytics (bundle-id uint))
+  (let (
+    (bundle (unwrap! (map-get? menu-bundles { bundle-id: bundle-id }) none))
+    (current-day (get-current-day))
+    (daily-stats (map-get? bundle-daily-stats { bundle-id: bundle-id, day: current-day }))
+  )
+    (some {
+      bundle: bundle,
+      current-price: (get-bundle-price bundle-id),
+      savings: (get-bundle-savings bundle-id),
+      daily-stats: daily-stats
+    })
+  )
+)
+
+(define-read-only (get-bundle-count)
+  (var-get bundle-counter)
+)
+
 ;; private functions
 (define-private (calculate-price-with-multipliers (base-price uint) (multiplier1 uint) (multiplier2 uint) (multiplier3 uint))
   (/ (* (* (* base-price multiplier1) multiplier2) multiplier3) u1000000)
+)
+
+(define-private (record-bundle-item-demand (bundle-id uint))
+  (let ((current-day (get-current-day)))
+    (fold record-single-item-from-bundle (list u1 u2 u3 u4 u5) { bundle-id: bundle-id, day: current-day })
+    (ok true)
+  )
+)
+
+(define-private (record-single-item-from-bundle (item-id uint) (data { bundle-id: uint, day: uint }))
+  (let (
+    (bundle-id (get bundle-id data))
+    (day (get day data))
+    (bundle-item-data (map-get? bundle-items { bundle-id: bundle-id, item-id: item-id }))
+  )
+    (match bundle-item-data
+      item-data
+      (let (
+        (quantity (get quantity item-data))
+        (current-demand (default-to { orders: u0, total-revenue: u0 }
+                                   (map-get? daily-demand { item-id: item-id, day: day })))
+      )
+        (map-set daily-demand
+          { item-id: item-id, day: day }
+          {
+            orders: (+ (get orders current-demand) quantity),
+            total-revenue: (get total-revenue current-demand)
+          }
+        )
+        data
+      )
+      data
+    )
+  )
+)
+
+(define-private (calculate-bundle-item-price (item-id uint) (data { bundle-id: uint, total: uint }))
+  (let (
+    (bundle-id (get bundle-id data))
+    (current-total (get total data))
+    (bundle-item-data (map-get? bundle-items { bundle-id: bundle-id, item-id: item-id }))
+  )
+    (match bundle-item-data
+      item-data
+      (let (
+        (quantity (get quantity item-data))
+        (item-price (get-dynamic-price item-id))
+      )
+        { bundle-id: bundle-id, total: (+ current-total (* item-price quantity)) }
+      )
+      data
+    )
+  )
+)
+
+(define-private (get-single-bundle-item (item-id uint) (data { bundle-id: uint, items: (list 10 uint) }))
+  (let (
+    (bundle-id (get bundle-id data))
+    (current-items (get items data))
+    (bundle-item-data (map-get? bundle-items { bundle-id: bundle-id, item-id: item-id }))
+  )
+    (if (is-some bundle-item-data)
+      { bundle-id: bundle-id, items: (unwrap-panic (as-max-len? (append current-items item-id) u10)) }
+      data
+    )
+  )
 )
