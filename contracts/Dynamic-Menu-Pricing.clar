@@ -18,6 +18,14 @@
 (define-constant ERR-BUNDLE-NOT-FOUND (err u111))
 (define-constant ERR-INVALID-BUNDLE (err u112))
 (define-constant ERR-BUNDLE-INACTIVE (err u113))
+(define-constant ERR-LOYALTY-EXISTS (err u114))
+
+(define-constant BRONZE-THRESHOLD u100000)
+(define-constant SILVER-THRESHOLD u500000)
+(define-constant GOLD-THRESHOLD u1000000)
+(define-constant BRONZE-DISCOUNT u5)
+(define-constant SILVER-DISCOUNT u10)
+(define-constant GOLD-DISCOUNT u15)
 
 (define-constant PEAK-HOUR-START u11)
 (define-constant PEAK-HOUR-END u14)
@@ -99,6 +107,17 @@
 (define-map bundle-daily-stats
   { bundle-id: uint, day: uint }
   { orders: uint, revenue: uint }
+)
+
+(define-map customer-loyalty
+  { customer: principal }
+  {
+    total-spent: uint,
+    tier: (string-ascii 10),
+    orders-count: uint,
+    joined-block: uint,
+    last-order-block: uint
+  }
 )
 
 ;; public functions
@@ -202,8 +221,10 @@
     (current-day (get-current-day))
     (current-demand (default-to { orders: u0, total-revenue: u0 } 
                     (map-get? daily-demand { item-id: item-id, day: current-day })))
-    (current-price (get-dynamic-price item-id))
-    (total-cost (* current-price quantity))
+    (base-price (get-dynamic-price item-id))
+    (loyalty-discount (get-loyalty-discount tx-sender))
+    (discounted-price (- base-price (/ (* base-price loyalty-discount) u100)))
+    (total-cost (* discounted-price quantity))
   )
     (asserts! (get active item) ERR-INVALID-ITEM)
     (asserts! (> quantity u0) ERR-INVALID-ITEM)
@@ -215,6 +236,7 @@
         total-revenue: (+ (get total-revenue current-demand) total-cost)
       }
     )
+    (unwrap-panic (update-loyalty tx-sender total-cost))
     (ok total-cost)
   )
 )
@@ -293,19 +315,21 @@
 (define-public (order-bundle (bundle-id uint))
   (let (
     (bundle (unwrap! (map-get? menu-bundles { bundle-id: bundle-id }) ERR-BUNDLE-NOT-FOUND))
-    (bundle-price (get-bundle-price bundle-id))
+    (base-bundle-price (get-bundle-price bundle-id))
+    (loyalty-discount (get-loyalty-discount tx-sender))
+    (discounted-bundle-price (- base-bundle-price (/ (* base-bundle-price loyalty-discount) u100)))
     (current-day (get-current-day))
     (current-stats (default-to { orders: u0, revenue: u0 }
                                (map-get? bundle-daily-stats { bundle-id: bundle-id, day: current-day })))
   )
     (asserts! (get active bundle) ERR-BUNDLE-INACTIVE)
-    (asserts! (> bundle-price u0) ERR-INVALID-BUNDLE)
+    (asserts! (> discounted-bundle-price u0) ERR-INVALID-BUNDLE)
     
     (map-set menu-bundles
       { bundle-id: bundle-id }
       (merge bundle {
         orders-count: (+ (get orders-count bundle) u1),
-        total-revenue: (+ (get total-revenue bundle) bundle-price)
+        total-revenue: (+ (get total-revenue bundle) discounted-bundle-price)
       })
     )
     
@@ -313,12 +337,13 @@
       { bundle-id: bundle-id, day: current-day }
       {
         orders: (+ (get orders current-stats) u1),
-        revenue: (+ (get revenue current-stats) bundle-price)
+        revenue: (+ (get revenue current-stats) discounted-bundle-price)
       }
     )
     
     (unwrap-panic (record-bundle-item-demand bundle-id))
-    (ok bundle-price)
+    (unwrap-panic (update-loyalty tx-sender discounted-bundle-price))
+    (ok discounted-bundle-price)
   )
 )
 
@@ -380,6 +405,7 @@
         total-revenue: (+ (get total-revenue current-demand) total-cost)
       }
     )
+    (unwrap-panic (update-loyalty tx-sender total-cost))
     (ok total-cost)
   )
 )
@@ -614,7 +640,109 @@
   (var-get bundle-counter)
 )
 
+(define-read-only (get-loyalty-status (customer principal))
+  (map-get? customer-loyalty { customer: customer })
+)
+
+(define-read-only (get-loyalty-tier (customer principal))
+  (match (map-get? customer-loyalty { customer: customer })
+    loyalty-data
+    (get tier loyalty-data)
+    "none"
+  )
+)
+
+(define-read-only (get-loyalty-discount (customer principal))
+  (match (map-get? customer-loyalty { customer: customer })
+    loyalty-data
+    (let ((total-spent (get total-spent loyalty-data)))
+      (if (>= total-spent GOLD-THRESHOLD)
+        GOLD-DISCOUNT
+        (if (>= total-spent SILVER-THRESHOLD)
+          SILVER-DISCOUNT
+          (if (>= total-spent BRONZE-THRESHOLD)
+            BRONZE-DISCOUNT
+            u0
+          )
+        )
+      )
+    )
+    u0
+  )
+)
+
+(define-read-only (get-next-tier-progress (customer principal))
+  (match (map-get? customer-loyalty { customer: customer })
+    loyalty-data
+    (let ((total-spent (get total-spent loyalty-data)))
+      (if (>= total-spent GOLD-THRESHOLD)
+        { next-tier: "max", spent: total-spent, required: GOLD-THRESHOLD, remaining: u0 }
+        (if (>= total-spent SILVER-THRESHOLD)
+          { next-tier: "gold", spent: total-spent, required: GOLD-THRESHOLD, remaining: (- GOLD-THRESHOLD total-spent) }
+          (if (>= total-spent BRONZE-THRESHOLD)
+            { next-tier: "silver", spent: total-spent, required: SILVER-THRESHOLD, remaining: (- SILVER-THRESHOLD total-spent) }
+            { next-tier: "bronze", spent: total-spent, required: BRONZE-THRESHOLD, remaining: (- BRONZE-THRESHOLD total-spent) }
+          )
+        )
+      )
+    )
+    { next-tier: "bronze", spent: u0, required: BRONZE-THRESHOLD, remaining: BRONZE-THRESHOLD }
+  )
+)
+
 ;; private functions
+(define-private (update-loyalty (customer principal) (amount-spent uint))
+  (let (
+    (current-block stacks-block-height)
+    (existing-loyalty (map-get? customer-loyalty { customer: customer }))
+  )
+    (match existing-loyalty
+      loyalty-data
+      (let (
+        (new-total-spent (+ (get total-spent loyalty-data) amount-spent))
+        (new-tier (calculate-tier new-total-spent))
+      )
+        (map-set customer-loyalty
+          { customer: customer }
+          (merge loyalty-data {
+            total-spent: new-total-spent,
+            tier: new-tier,
+            orders-count: (+ (get orders-count loyalty-data) u1),
+            last-order-block: current-block
+          })
+        )
+        (ok true)
+      )
+      (begin
+        (map-set customer-loyalty
+          { customer: customer }
+          {
+            total-spent: amount-spent,
+            tier: (calculate-tier amount-spent),
+            orders-count: u1,
+            joined-block: current-block,
+            last-order-block: current-block
+          }
+        )
+        (ok true)
+      )
+    )
+  )
+)
+
+(define-private (calculate-tier (total-spent uint))
+  (if (>= total-spent GOLD-THRESHOLD)
+    "gold"
+    (if (>= total-spent SILVER-THRESHOLD)
+      "silver"
+      (if (>= total-spent BRONZE-THRESHOLD)
+        "bronze"
+        "none"
+      )
+    )
+  )
+)
+
 (define-private (calculate-price-with-multipliers (base-price uint) (multiplier1 uint) (multiplier2 uint) (multiplier3 uint))
   (/ (* (* (* base-price multiplier1) multiplier2) multiplier3) u1000000)
 )
