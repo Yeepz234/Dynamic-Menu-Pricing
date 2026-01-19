@@ -19,6 +19,9 @@
 (define-constant ERR-INVALID-BUNDLE (err u112))
 (define-constant ERR-BUNDLE-INACTIVE (err u113))
 (define-constant ERR-LOYALTY-EXISTS (err u114))
+(define-constant ERR-FLASH-SALE-ACTIVE (err u115))
+(define-constant ERR-NO-FLASH-SALE (err u116))
+(define-constant ERR-FLASH-SALE-EXPIRED (err u117))
 
 (define-constant BRONZE-THRESHOLD u100000)
 (define-constant SILVER-THRESHOLD u500000)
@@ -41,6 +44,7 @@
 (define-data-var vote-threshold uint u10)
 (define-data-var menu-item-counter uint u0)
 (define-data-var bundle-counter uint u0)
+(define-data-var flash-sale-counter uint u0)
 
 ;; data maps
 (define-map menu-items 
@@ -118,6 +122,24 @@
     joined-block: uint,
     last-order-block: uint
   }
+)
+
+(define-map flash-sales
+  { sale-id: uint }
+  {
+    item-id: uint,
+    discount-percentage: uint,
+    start-block: uint,
+    end-block: uint,
+    max-quantity: uint,
+    sold-quantity: uint,
+    active: bool
+  }
+)
+
+(define-map item-flash-sale
+  { item-id: uint }
+  { sale-id: uint }
 )
 
 ;; public functions
@@ -246,6 +268,82 @@
     (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-OWNER-ONLY)
     (var-set contract-owner new-owner)
     (ok true)
+  )
+)
+
+(define-public (create-flash-sale (item-id uint) (discount-percentage uint) (duration-blocks uint) (max-quantity uint))
+  (let (
+    (sale-id (+ (var-get flash-sale-counter) u1))
+    (item (unwrap! (map-get? menu-items { item-id: item-id }) ERR-NOT-FOUND))
+    (existing-sale (map-get? item-flash-sale { item-id: item-id }))
+    (current-block stacks-block-height)
+  )
+    (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-OWNER-ONLY)
+    (asserts! (get active item) ERR-INVALID-ITEM)
+    (asserts! (and (> discount-percentage u0) (<= discount-percentage u70)) ERR-INVALID-MULTIPLIER)
+    (asserts! (> duration-blocks u0) ERR-INVALID-MULTIPLIER)
+    (asserts! (> max-quantity u0) ERR-INVALID-MULTIPLIER)
+    (asserts! (is-none existing-sale) ERR-FLASH-SALE-ACTIVE)
+    
+    (map-set flash-sales
+      { sale-id: sale-id }
+      {
+        item-id: item-id,
+        discount-percentage: discount-percentage,
+        start-block: current-block,
+        end-block: (+ current-block duration-blocks),
+        max-quantity: max-quantity,
+        sold-quantity: u0,
+        active: true
+      }
+    )
+    (map-set item-flash-sale { item-id: item-id } { sale-id: sale-id })
+    (var-set flash-sale-counter sale-id)
+    (ok sale-id)
+  )
+)
+
+(define-public (end-flash-sale (sale-id uint))
+  (let (
+    (sale (unwrap! (map-get? flash-sales { sale-id: sale-id }) ERR-NO-FLASH-SALE))
+    (item-id (get item-id sale))
+  )
+    (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-OWNER-ONLY)
+    (asserts! (get active sale) ERR-NO-FLASH-SALE)
+    
+    (map-set flash-sales
+      { sale-id: sale-id }
+      (merge sale { active: false })
+    )
+    (map-delete item-flash-sale { item-id: item-id })
+    (ok true)
+  )
+)
+
+(define-public (purchase-flash-sale (item-id uint) (quantity uint))
+  (let (
+    (sale-mapping (unwrap! (map-get? item-flash-sale { item-id: item-id }) ERR-NO-FLASH-SALE))
+    (sale-id (get sale-id sale-mapping))
+    (sale (unwrap! (map-get? flash-sales { sale-id: sale-id }) ERR-NO-FLASH-SALE))
+    (item (unwrap! (map-get? menu-items { item-id: item-id }) ERR-NOT-FOUND))
+    (current-block stacks-block-height)
+    (base-price (get base-price item))
+    (discount (get discount-percentage sale))
+    (discounted-price (- base-price (/ (* base-price discount) u100)))
+    (total-cost (* discounted-price quantity))
+    (new-sold-quantity (+ (get sold-quantity sale) quantity))
+  )
+    (asserts! (get active sale) ERR-NO-FLASH-SALE)
+    (asserts! (<= current-block (get end-block sale)) ERR-FLASH-SALE-EXPIRED)
+    (asserts! (<= new-sold-quantity (get max-quantity sale)) ERR-INSUFFICIENT-FUNDS)
+    (asserts! (> quantity u0) ERR-INVALID-ITEM)
+    
+    (map-set flash-sales
+      { sale-id: sale-id }
+      (merge sale { sold-quantity: new-sold-quantity })
+    )
+    (unwrap-panic (update-loyalty tx-sender total-cost))
+    (ok { sale-price: discounted-price, total-cost: total-cost, quantity: quantity })
   )
 )
 
@@ -638,6 +736,61 @@
 
 (define-read-only (get-bundle-count)
   (var-get bundle-counter)
+)
+
+(define-read-only (get-flash-sale (sale-id uint))
+  (map-get? flash-sales { sale-id: sale-id })
+)
+
+(define-read-only (get-item-flash-sale (item-id uint))
+  (match (map-get? item-flash-sale { item-id: item-id })
+    sale-mapping
+    (map-get? flash-sales { sale-id: (get sale-id sale-mapping) })
+    none
+  )
+)
+
+(define-read-only (get-flash-sale-price (item-id uint))
+  (match (map-get? item-flash-sale { item-id: item-id })
+    sale-mapping
+    (let (
+      (sale (unwrap! (map-get? flash-sales { sale-id: (get sale-id sale-mapping) }) u0))
+      (item (unwrap! (map-get? menu-items { item-id: item-id }) u0))
+      (base-price (get base-price item))
+      (discount (get discount-percentage sale))
+    )
+      (if (and (get active sale) (<= stacks-block-height (get end-block sale)))
+        (- base-price (/ (* base-price discount) u100))
+        u0
+      )
+    )
+    u0
+  )
+)
+
+(define-read-only (get-flash-sale-status (item-id uint))
+  (match (map-get? item-flash-sale { item-id: item-id })
+    sale-mapping
+    (let (
+      (sale (unwrap! (map-get? flash-sales { sale-id: (get sale-id sale-mapping) }) none))
+      (current-block stacks-block-height)
+      (remaining-blocks (if (> (get end-block sale) current-block) (- (get end-block sale) current-block) u0))
+      (remaining-quantity (- (get max-quantity sale) (get sold-quantity sale)))
+    )
+      (some {
+        active: (and (get active sale) (<= current-block (get end-block sale))),
+        discount-percentage: (get discount-percentage sale),
+        remaining-blocks: remaining-blocks,
+        remaining-quantity: remaining-quantity,
+        sold-quantity: (get sold-quantity sale)
+      })
+    )
+    none
+  )
+)
+
+(define-read-only (get-flash-sale-count)
+  (var-get flash-sale-counter)
 )
 
 (define-read-only (get-loyalty-status (customer principal))
